@@ -1,0 +1,248 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+import "@openzeppelin/contracts/utils/Context.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
+
+contract PublicSaleOverflowVesting is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    error NotAllowed();
+    error NotStartedOrAlreadyEnded();
+    error AlreadyStarted();
+    error NotFinished();
+    error AlreadyFinished();
+    error CommitOutOfRange();
+    error InsufficientCommitment();
+    error MaxReached();
+    error HasClaimed();
+    error InvalidParam();
+    error EthTransferFailed();
+    error VestingNotCreated();
+
+    IERC20 public immutable salesToken;
+    uint256 public immutable tokensToSell;
+    uint256 public immutable ethersToRaise;
+    uint256 public immutable refundThreshold;
+    uint256 public startTime;
+    uint256 public claimStartTime;
+    address public immutable burnAddress;
+
+    uint256 public constant MIN_COMMITMENT = 0.002 ether; 
+    uint256 public constant MAX_COMMITMENT = 1000 ether;
+
+    bool public started;
+    bool public finished;
+
+    uint256 public totalCommitments;
+    mapping(address => uint256) public commitments;
+    mapping(address => bool) public userClaimed;
+
+    event Commit(address indexed buyer, uint256 amount);
+    event ClaimTokens(address indexed buyer, uint256 token);
+    event ClaimETH(address indexed buyer, uint256 token);
+
+    /**VESTING VARIABLES */
+    mapping(address => uint256) public vestings;
+    mapping(address => uint256) public tokensReleased;
+
+    uint256 VestingStartTimestamp;
+    uint256 vestingDurationSeconds;
+
+    constructor(
+        IERC20 _salesToken,
+        uint256 _tokensToSell,
+        uint256 _ethersToRaise,
+        uint256 _refundThreshold,
+        address _burnAddress
+    ) {
+        if (_ethersToRaise == 0) revert InvalidParam();
+        if (_ethersToRaise < _refundThreshold) revert InvalidParam();
+        if (MIN_COMMITMENT >= MAX_COMMITMENT) revert InvalidParam();
+
+        salesToken = _salesToken;
+        tokensToSell = _tokensToSell;
+        ethersToRaise = _ethersToRaise;
+        refundThreshold = _refundThreshold;
+        burnAddress = _burnAddress;
+    }
+
+    function setTime(
+        uint256 _startTime,
+        uint256 _claimStartTime
+    ) external onlyOwner {
+        if (_startTime <= block.timestamp) revert InvalidParam();
+        if (_claimStartTime <= _startTime) revert InvalidParam();
+        if (started == true) revert AlreadyStarted();
+
+        startTime = _startTime;
+        claimStartTime = _claimStartTime;
+    }
+
+    function start() external onlyOwner {
+        if (started) revert AlreadyStarted();
+        if (startTime == 0) revert InvalidParam();
+        if (claimStartTime == 0) revert InvalidParam();
+        started = true;
+
+        salesToken.safeTransferFrom(msg.sender, address(this), tokensToSell);
+    }
+
+    function commit() external payable nonReentrant {
+        if (
+            !started ||
+            block.timestamp <= startTime ||
+            block.timestamp >= claimStartTime
+        ) revert NotStartedOrAlreadyEnded();
+
+        if (
+            MIN_COMMITMENT > commitments[msg.sender] + msg.value ||
+            commitments[msg.sender] + msg.value > MAX_COMMITMENT
+        ) revert CommitOutOfRange();
+
+        commitments[msg.sender] += msg.value;
+        totalCommitments += msg.value;
+        emit Commit(msg.sender, msg.value);
+    }
+
+    function _simulateClaim(
+        address account
+    ) internal view returns (uint256, uint256) {
+        if (commitments[account] == 0) return (0, 0);
+        if (totalCommitments >= refundThreshold) {
+            uint256 ethersToSpend = Math.min(
+                commitments[account],
+                (commitments[account] * ethersToRaise) / totalCommitments
+            );
+            uint256 ethersToRefund = commitments[account] - ethersToSpend;
+            ethersToRefund = (ethersToRefund / 10) * 10; // round down fixing overflow
+            uint256 tokensToReceive = (tokensToSell * ethersToSpend) /
+                ethersToRaise;
+            return (ethersToRefund, tokensToReceive);
+        } else {
+            return (commitments[msg.sender], 0);
+        }
+    }
+
+    function simulateClaimExternal(
+        address account
+    ) external view returns (uint256, uint256) {
+        (uint ethersToRefund, uint tokensToReceive) = _simulateClaim(account);
+        return (ethersToRefund, tokensToReceive);
+    }
+
+    function claim() external nonReentrant returns (uint256, uint256) {
+        if (block.timestamp <= claimStartTime)
+            revert NotStartedOrAlreadyEnded();
+
+        if (commitments[msg.sender] == 0) revert InsufficientCommitment();
+
+        if (userClaimed[msg.sender] == true) revert HasClaimed();
+
+        userClaimed[msg.sender] = true;
+        (uint256 ethersToRefund, uint256 tokensToReceive) = _simulateClaim(
+            msg.sender
+        );
+        if (totalCommitments >= refundThreshold) {
+            uint256 tokensToReceiveImmediate = (tokensToReceive * 3) / 10; // @audit round down
+            uint256 tokensToVest = tokensToReceive - tokensToReceiveImmediate; // @audit rounds up
+            salesToken.safeTransfer(msg.sender, tokensToReceiveImmediate);
+            _createVestingSchedule(msg.sender, tokensToVest);
+
+            emit ClaimTokens(msg.sender, tokensToReceive);
+
+            if (ethersToRefund > 0) {
+                (bool success, ) = msg.sender.call{value: ethersToRefund}("");
+                require(success, "Failed to transfer ether");
+            }
+
+            emit ClaimETH(msg.sender, ethersToRefund);
+            return (ethersToRefund, tokensToReceive);
+        } else {
+            uint256 amt = commitments[msg.sender];
+            commitments[msg.sender] = 0;
+            (bool success, ) = msg.sender.call{value: amt}("");
+            require(success, "Failed to transfer ether");
+            emit ClaimETH(msg.sender, amt);
+            return (amt, 0);
+        }
+    }
+
+    function finish() external onlyOwner returns (uint, uint) {
+        if (block.timestamp <= claimStartTime) revert NotFinished();
+        if (finished) revert AlreadyFinished();
+
+        finished = true;
+
+        if (totalCommitments >= refundThreshold) {
+            (bool success, ) = payable(owner()).call{
+                value: Math.min(ethersToRaise, totalCommitments)
+            }("");
+            require(success, "Failed to transfer ether");
+            if (ethersToRaise > totalCommitments) {
+                uint256 tokensToBurn = (tokensToSell *
+                    (ethersToRaise - totalCommitments)) / ethersToRaise;
+                salesToken.safeTransfer(burnAddress, tokensToBurn);
+                return (
+                    Math.min(ethersToRaise, totalCommitments),
+                    tokensToBurn
+                );
+            }
+        } else {
+            salesToken.safeTransfer(owner(), tokensToSell);
+            return (0, tokensToSell);
+        }
+    }
+
+    function _createVestingSchedule(
+        address beneficiaryAddress,
+        uint256 amount
+    ) internal {
+        vestings[beneficiaryAddress] = amount;
+
+        // emit VestingCreated();
+    }
+
+    function _computeReleasable(
+        address _claimer
+    ) internal view returns (uint256) {
+        if (block.timestamp < VestingStartTimestamp) {
+            return 0;
+        } else if (
+            block.timestamp > VestingStartTimestamp + vestingDurationSeconds
+        ) {
+            return vestings[_claimer];
+        } else {
+            return
+                ((vestings[_claimer] *
+                    (block.timestamp - VestingStartTimestamp)) /
+                    vestingDurationSeconds) - tokensReleased[_claimer];
+        }
+    }
+
+    function release(address _claimer) external {
+        
+        if (vestings[_claimer] == 0) revert VestingNotCreated();
+        if (vestings[_claimer] - tokensReleased[_claimer] == 0)
+            revert HasClaimed();
+
+        uint256 releasable = _computeReleasable(_claimer);
+        if (releasable - tokensReleased[_claimer] > vestings[_claimer])
+            revert MaxReached();
+
+        unchecked {
+            tokensReleased[_claimer] += releasable;
+        }
+        salesToken.safeTransfer(msg.sender, releasable);
+    }
+
+    function simulateReleasable(
+        address _claimer
+    ) external view returns (uint256) {
+        return _computeReleasable(_claimer);
+    }
+}
